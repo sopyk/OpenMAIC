@@ -10,24 +10,17 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 permissions:
-  contents: write
   packages: write
-  workflows: write
 
 jobs:
-  check-and-sync:
+  check-release:
     runs-on: ubuntu-latest
     outputs:
       new_release: ${{ steps.check.outputs.new_release }}
       latest_tag: ${{ steps.check.outputs.latest_tag }}
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fetch upstream latest release
+      - name: Check upstream latest release
         id: check
         run: |
           # 获取上游最新正式 release（排除 pre-release）
@@ -41,33 +34,32 @@ jobs:
           echo "Latest upstream release: $LATEST_RELEASE"
           echo "latest_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
           
-          # 检查本地是否已有这个 tag
-          if git rev-parse "$LATEST_RELEASE" >/dev/null 2>&1; then
-            echo "Tag $LATEST_RELEASE already exists locally, no action needed"
+          # 检查本仓库是否已有同名镜像(tag),有则跳过
+          # 用 GHCR package API 判断
+          PACKAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/v2/$PACKAGE_NAME/manifests/$LATEST_RELEASE")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Image tag $LATEST_RELEASE already exists in GHCR, no action needed"
             echo "new_release=false" >> $GITHUB_OUTPUT
           else
-            echo "New release detected: $LATEST_RELEASE"
+            echo "New release detected: $LATEST_RELEASE (image tag does not exist yet)"
             echo "new_release=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Sync upstream tag to fork
-        if: steps.check.outputs.new_release == 'true'
-        run: |
-          git remote add upstream https://github.com/$UPSTREAM_REPO.git
-          git fetch upstream tag ${{ steps.check.outputs.latest_tag }}
-          git push origin tag ${{ steps.check.outputs.latest_tag }}
-          echo "Successfully pushed tag ${{ steps.check.outputs.latest_tag }} to fork"
-
   build-docker:
-    needs: check-and-sync
-    if: needs.check-and-sync.outputs.new_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.new_release == 'true'
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout at release tag
+      - name: Checkout upstream release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.check-and-sync.outputs.latest_tag }}
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-release.outputs.latest_tag }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -89,7 +81,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ needs.check-and-sync.outputs.latest_tag }}
+            type=raw,value=${{ needs.check-release.outputs.latest_tag }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -109,7 +101,7 @@ jobs:
           echo ""
           echo "Image tags:"
           echo "- ${{ env.IMAGE_NAME }}:latest"
-          echo "- ${{ env.IMAGE_NAME }}:${{ needs.check-and-sync.outputs.latest_tag }}"
+          echo "- ${{ env.IMAGE_NAME }}:${{ needs.check-release.outputs.latest_tag }}"
           echo ""
           echo "Pull command:"
           echo "\`\`\`bash"
